@@ -59,6 +59,8 @@ This fork customizes the **PIRsensorSwitch** usermod ([usermods/PIR_sensor_switc
 - Remembers the preset active right before PIR motion triggered (`scheduledPresetBeforePIR`).
 - On PIR timeout, `switchStrip(false)` now prioritizes: (1) last scheduled preset if `use-time-preset` + `use-schedule-fallback` are on, (2) fixed `off-preset` if `use-time-preset` is on but fallback is off, (3) legacy behavior (off-preset → previous playlist → previous preset → lights off) otherwise.
 
+**Build target note:** `platformio.ini`'s `default_envs` was changed to `esp32s3_4M_qspi` to match the deployed device (ESP32-S3, 240MHz, 4MB flash) reported by the WLED app. This was inferred after the fact and not confirmed against the original build config used to flash that device — the original build may have used a different env, and ESP32-S3 support in the WLED/arduino-esp32 versions pinned by this repo may have had known issues at the time. If the CI-built firmware for `esp32s3_4M_qspi` doesn't boot or behave correctly on your board, try the other ESP32-S3 envs in `platformio.ini` (`esp32s3dev_16MB_opi`, `esp32s3dev_8MB_opi`) or check flash size/PSRAM config against your specific board.
+
 This lets lights return to whatever the schedule had running before motion was detected, rather than snapping to a static "off" state.
 
 ## �📲 Quick start guide and documentation
