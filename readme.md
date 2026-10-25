@@ -46,22 +46,120 @@ A fast and feature-rich implementation of an ESP8266/ESP32 webserver to control 
 - Infrared remotes (24-key RGB, receiver required)  
 - Simple timers/schedules (time from NTP, timezones/DST supported)  
 
-## �️ Custom modifications in this fork
+## Custom modifications in this fork
 
-This fork customizes the **PIRsensorSwitch** usermod ([usermods/PIR_sensor_switch/usermod_PIR_sensor_switch.h](usermods/PIR_sensor_switch/usermod_PIR_sensor_switch.h)) to restore a Time-Controlled Preset after PIR motion ends, instead of always falling back to a fixed off-preset.
+This private deployment fork is based on WLED 0.15.1 and modifies the
+[`PIRsensorSwitch`](usermods/PIR_sensor_switch/usermod_PIR_sensor_switch.h) usermod for two related
+requirements:
 
-**New config options** (exposed in the usermod settings UI, persisted to `cfg.json`):
-- `use-time-preset` — master switch enabling schedule-aware restore behavior after the PIR off-timer expires.
-- `use-schedule-fallback` — when enabled, restores the *last scheduled preset* on PIR timeout; when disabled, applies the fixed `off-preset` instead.
+1. PIR motion must return to the correct time-controlled preset when its timeout ends.
+2. An external presentation, currently the MMEntrance Arcade, must temporarily own the visible
+   preset without replacing WLED's schedule or PIR policy.
 
-**Behavior changes:**
-- Tracks the most recently scheduler-applied preset (`lastScheduledPreset`) via `onStateChange()`, so it stays up to date whenever the day/night scheduler switches presets independently of PIR activity.
-- Remembers the preset active right before PIR motion triggered (`scheduledPresetBeforePIR`).
-- On PIR timeout, `switchStrip(false)` now prioritizes: (1) last scheduled preset if `use-time-preset` + `use-schedule-fallback` are on, (2) fixed `off-preset` if `use-time-preset` is on but fallback is off, (3) legacy behavior (off-preset → previous playlist → previous preset → lights off) otherwise.
+### Schedule-aware PIR restore
 
-**Build target note:** `platformio.ini`'s `default_envs` was changed to `esp32s3_4M_qspi` to match the deployed device (ESP32-S3, 240MHz, 4MB flash) reported by the WLED app. This was inferred after the fact and not confirmed against the original build config used to flash that device — the original build may have used a different env, and ESP32-S3 support in the WLED/arduino-esp32 versions pinned by this repo may have had known issues at the time. If the CI-built firmware for `esp32s3_4M_qspi` doesn't boot or behave correctly on your board, try the other ESP32-S3 envs in `platformio.ini` (`esp32s3dev_16MB_opi`, `esp32s3dev_8MB_opi`) or check flash size/PSRAM config against your specific board.
+Stock `PIRsensorSwitch` can apply a fixed `off-preset` when motion ends. That is insufficient for an
+installation whose normal preset changes through WLED timers: a morning, daytime, evening, or off
+schedule can change while PIR motion is active.
 
-This lets lights return to whatever the schedule had running before motion was detected, rather than snapping to a static "off" state.
+This fork adds two persisted usermod settings:
+
+- `use-time-preset`: enables schedule-aware behavior after the PIR off-timer expires.
+- `use-schedule-fallback`: restores the most recent time-controlled preset when enabled; when
+  disabled, `off-preset` remains the fallback.
+
+The restore order after PIR timeout is:
+
+1. Restore `lastScheduledPreset` when both options are enabled and a scheduled preset is known.
+2. Apply `off-preset` when time-preset handling is enabled but schedule fallback is disabled.
+3. Use the legacy off-preset, previous playlist, previous preset, temporary preset, or lights-off
+   behavior.
+
+WLED timer, sunrise, and sunset macros now apply presets with `CALL_MODE_TIME_PRESET`. This dedicated
+call mode lets the usermod distinguish real scheduler changes from MQTT, web UI, button, PIR, and
+other preset changes. External preset `222`, for example, can no longer become the remembered
+scheduled preset merely because it was selected through MQTT.
+
+### Presentation override
+
+The presentation override is controlled through WLED's existing JSON API, including the MQTT JSON
+API topic. It introduces no additional server or protocol.
+
+Start an override and atomically select its preset:
+
+```json
+{
+  "PIRsensorSwitch": {
+    "presentation": "start",
+    "preset": 222
+  },
+  "ps": 222
+}
+```
+
+Release the override:
+
+```json
+{
+  "PIRsensorSwitch": {
+    "presentation": "restore"
+  }
+}
+```
+
+Override behavior:
+
+- The first `start` snapshots the current non-PIR preset as the restoration baseline.
+- Repeated `start` commands are idempotent and reassert the presentation preset without overwriting
+  the baseline. MMEntrance uses this to repair missed state after MQTT or WLED reconnects.
+- PIR transitions cannot replace the presentation preset while the override is active.
+- A WLED timer, sunrise, or sunset event during the override updates `lastScheduledPreset`, then the
+  presentation preset is immediately reasserted.
+- `restore` releases the override and asynchronously applies the latest scheduled preset.
+- A restore-pending guard prevents WLED's immediate state callback from misclassifying the outgoing
+  presentation preset as the new baseline.
+- The override is intentionally runtime-only. A controller reboot clears it, allowing retained
+  MMEntrance mode to reassert the correct state after reconnect.
+
+For MMEntrance, the MQTT topic is `wled/entrance/api`, Arcade uses preset `222`, and Mirror or Guest
+releases the override instead of forcing a fixed normal preset.
+
+### Production target
+
+The deployed controller has been queried and updated successfully with this repository's
+`esp32s3_4M_qspi` environment:
+
+- WLED 0.15.1, release `ESP32-S3_4M_qspi`
+- ESP32-S3 at 240 MHz
+- 4 MB flash with PSRAM
+- 60 RGBW LEDs on GPIO 6
+- PIR input on GPIO 8 with a 300-second timeout
+- PIR on-preset `102`, off-preset `100`
+- time-controlled presets `100` and `101`
+- Arcade preset `222`
+
+The environment explicitly defines `USERMOD_PIRSWITCH`; without that build flag, the modified
+header is present in the source tree but the usermod is not instantiated in the firmware.
+
+### Build and deployment
+
+```powershell
+py -m pip install --user platformio
+npm install
+npm test
+py -m platformio run -e esp32s3_4M_qspi
+```
+
+The OTA application image is generated at:
+
+```text
+build_output/release/WLED_0.15.1_ESP32-S3_4M_qspi.bin
+```
+
+Upload only this application image through WLED's `/update` page. Do not upload a filesystem image:
+the LittleFS partition contains `cfg.json`, `wsec.json`, and `presets.json`. Always back those files
+up before an update. See [docs/WLED-ARCADE-FIRMWARE.md](docs/WLED-ARCADE-FIRMWARE.md) for the complete
+backup, OTA, rollback, and validation procedure.
 
 ## �📲 Quick start guide and documentation
 

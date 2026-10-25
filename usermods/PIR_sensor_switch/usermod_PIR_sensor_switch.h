@@ -51,8 +51,10 @@ private:
   bool sensorPinState[PIR_SENSOR_MAX_SENSORS] = {LOW}; // current PIR sensor pin state
 
   uint8_t scheduledPresetBeforePIR = 0; // stores preset active before PIR triggered
-  uint8_t lastSchedulerPreset = 0; // remember the last preset that scheduler activated
-  uint8_t lastScheduledPreset = 0;   // remember last preset applied by schedule or user
+  uint8_t lastScheduledPreset = 0;
+  uint8_t presentationPreset = 0;
+  bool presentationOverride = false;
+  bool presentationRestorePending = false;
   bool useScheduleFallback = true;   // new UI toggle
   static const char _useScheduleFallback[];
 
@@ -120,34 +122,6 @@ private:
    */
   bool handleOffTimer();
 
- /**
- * Return the active Time-Controlled Preset if one is running (WLED v0.15.1 compatible)
- */
-uint8_t getActiveTimePreset() {
-  // For 0.15.1: currentPreset is the only indicator of a loaded preset
-  if (currentPreset > 0 && currentPreset <= 250) return currentPreset;
-  // if no preset loaded, use the last one we stored before PIR
-  if (scheduledPresetBeforePIR > 0 && scheduledPresetBeforePIR <= 250) return scheduledPresetBeforePIR;
-  return 0;
-}
-
-/**
- * Try to detect the active scheduled preset (based on WLED scheduler)
- */
-uint8_t detectScheduledPreset() {
-  // when scheduler triggers, WLED sets currentPreset to that value for at least a second
-  // so if bri==0 but last known preset was stored, return that
-  if (currentPreset > 0 && currentPreset <= 250) {
-    lastSchedulerPreset = currentPreset;
-    return currentPreset;
-  }
-  // if lights are off (bri==0) and we have a stored scheduled preset, return it
-  if (bri == 0 && lastSchedulerPreset > 0 && lastSchedulerPreset <= 250) {
-    return lastSchedulerPreset;
-  }
-  return 0;
-}
-
 public:
   //Functions called by WLED
   void setup() override;
@@ -199,6 +173,13 @@ bool PIRsensorSwitch::isDayTime() {
 
 void PIRsensorSwitch::switchStrip(bool switchOn)
 {
+  if (presentationOverride) {
+    PIRtriggered = false;
+    if (presentationPreset > 0 && currentPreset != presentationPreset) {
+      applyPreset(presentationPreset, CALL_MODE_BUTTON_PRESET);
+    }
+    return;
+  }
   if (m_offOnly && bri && (switchOn || (!PIRtriggered && !switchOn))) return;
   if (PIRtriggered && switchOn) return;
 
@@ -478,8 +459,20 @@ void PIRsensorSwitch::addToJsonInfo(JsonObject &root)
 void PIRsensorSwitch::onStateChange(uint8_t mode) {
   if (!initDone) return;
 
-  // if WLED switched preset normally (not because of PIR)
-  if (!PIRtriggered && currentPreset > 0 && currentPreset <= 250) {
+  if (presentationRestorePending) {
+    if (mode == CALL_MODE_BUTTON_PRESET && currentPreset == lastScheduledPreset) {
+      presentationRestorePending = false;
+    }
+    return;
+  }
+
+  if (mode == CALL_MODE_TIME_PRESET && currentPreset > 0 && currentPreset <= 250) {
+    lastScheduledPreset = currentPreset;
+    if (presentationOverride && presentationPreset > 0) {
+      applyPreset(presentationPreset, CALL_MODE_BUTTON_PRESET);
+    }
+  } else if (!presentationOverride && !PIRtriggered && currentPreset > 0 && currentPreset <= 250) {
+    // Seed the baseline from normal operation before the first timer event after boot.
     lastScheduledPreset = currentPreset;
   }
 
@@ -497,6 +490,27 @@ void PIRsensorSwitch::readFromJsonState(JsonObject &root)
   if (!usermod.isNull()) {
     if (usermod[FPSTR(_enabled)].is<bool>()) {
       enabled = usermod[FPSTR(_enabled)].as<bool>();
+    }
+    const char* presentation = usermod["presentation"];
+    if (presentation && !strcmp(presentation, "start")) {
+      uint8_t preset = usermod["preset"] | 0;
+      if (preset > 0 && preset <= 250) {
+        if (!presentationOverride && currentPreset > 0 && currentPreset <= 250) {
+          lastScheduledPreset = currentPreset;
+        }
+        presentationPreset = preset;
+        presentationOverride = true;
+        presentationRestorePending = false;
+        offTimerStart = 0;
+        PIRtriggered = false;
+      }
+    } else if (presentation && !strcmp(presentation, "restore")) {
+      presentationOverride = false;
+      presentationPreset = 0;
+      if (lastScheduledPreset > 0) {
+        presentationRestorePending = true;
+        applyPreset(lastScheduledPreset, CALL_MODE_BUTTON_PRESET);
+      }
     }
   }
 }
